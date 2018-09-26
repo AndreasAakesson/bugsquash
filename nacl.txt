@@ -1,0 +1,14 @@
+Iface out {
+  index: 0,
+  address: 10.0.1.10,
+  netmask: 255.255.255.0
+}
+
+Iface in1 { index: 1, address: 10.0.0.101, netmask: 255.255.255.0 }
+Iface in2 { index: 2, address: 10.0.0.102, netmask: 255.255.255.0 }
+Iface in3 { index: 3, address: 10.0.0.103, netmask: 255.255.255.0 }
+Iface in4 { index: 4, address: 10.0.0.104, netmask: 255.255.255.0 }
+Iface in5 { index: 5, address: 10.0.0.105, netmask: 255.255.255.0 }
+Iface in6 { index: 6, address: 10.0.0.106, netmask: 255.255.255.0 }
+Iface in7 { index: 7, address: 10.0.0.107, netmask: 255.255.255.0 }
+Iface in8 { index: 8, address: 10.0.0.108, netmask: 255.255.255.0 }
