@@ -26,4 +26,6 @@ iperf3 -c 10.0.0.101 -p 5201 -t 600 # run for 600 seconds
 Do the same for all others, just change last number in IP and port:
 ```
 iperf3 -c 10.0.0.102 -p 5202 -t 600 # etc etc
-``
+```
+
+To terminate test and servers: `killall iperf3`
