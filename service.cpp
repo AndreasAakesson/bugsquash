@@ -23,6 +23,7 @@
 #include <net/nat/napt.hpp>
 #include <net/router.hpp>
 #include <os>
+#include <profile>
 
 using namespace net;
 
@@ -71,19 +72,20 @@ Filter_verdict<IP4> iperf_dnat(IP4::IP_packet_ptr pckt, Inet&, Conntrack::Entry_
 
 struct Buffer
 {
-  static constexpr size_t limit = 128;
+  static constexpr size_t limit = 2048;
   using Pkt_ptr = IP4::IP_packet_ptr;
 
   Buffer() = default;
 
   Buffer(Inet& stack)
     : inet{stack},
-      entries_added{Statman::get().create(Stat::UINT32,inet.ifname() + ".entries_added").get_uint32()},
-      entries_shipped{Statman::get().create(Stat::UINT32,inet.ifname() + ".entries_shipped").get_uint32()}
+      entries_added{Statman::get().create(Stat::UINT64,inet.ifname() + ".entries_added").get_uint64()},
+      entries_shipped{Statman::get().create(Stat::UINT64,inet.ifname() + ".entries_shipped").get_uint64()}
   {}
 
   struct Entry
   {
+    Inet&                 out;
     Pkt_ptr               pkt;
     ip4::Addr             dest;
     Conntrack::Entry_ptr  ct;
@@ -100,9 +102,10 @@ struct Buffer
 
   void ship_one()
   {
+    //printf("ship %s\n", inet.ifname().c_str());
     auto entry = std::move(entries.front());
     entries.pop_front();
-    inet.ip_obj().ship(std::move(entry->pkt), entry->dest, entry->ct);
+    entry->out.ip_obj().ship(std::move(entry->pkt), entry->dest, entry->ct);
     entries_shipped++;
   }
 
@@ -114,8 +117,8 @@ struct Buffer
 
 private:
   std::deque<std::unique_ptr<Entry>> entries;
-  uint32_t& entries_added;
-  uint32_t& entries_shipped;
+  uint64_t& entries_added;
+  uint64_t& entries_shipped;
 };
 
 struct Router_buffer
@@ -158,6 +161,7 @@ struct Router_buffer
 
   void process(size_t avail)
   {
+    //avail = avail*2;
     //printf("process begin %zu\n", avail);
     while(not buffers.empty() and avail)
     {
@@ -313,11 +317,13 @@ void Service::start(const std::string&)
       // it's being forwarded to "out"
       if(not out.transmit_queue_available())
       {
-        bool added = buffer.add(inet, {std::move(pckt), dest, entry});
-        /*if(added)
-          printf("added entry to %s\n", inet.ifname().c_str());
-        else
-          printf("failed to add entry to %s\n", inet.ifname().c_str());*/
+        bool added = buffer.add(inet, {out, std::move(pckt), dest, entry});
+        if(added) {
+          //printf("added entry to %s\n", inet.ifname().c_str());
+        }
+        else {
+          //printf("failed to add entry to %s\n", inet.ifname().c_str());
+        }
         return Filter_verdict<IP4>{nullptr, Filter_verdict_type::DROP};
       }
     }
@@ -327,8 +333,9 @@ void Service::start(const std::string&)
 
   router->forward_chain.chain.push_back(forward_hack);
 
+  StackSampler::begin();
   using namespace std::chrono;
-  Timers::periodic(3s, 3s, [](auto) {
+  Timers::periodic(2s, 5s, [](auto) {
     /*auto eth0_rx  = Statman::get().get_by_name("eth0.ethernet.packets_rx").get_uint64();
     auto eth0_tx  = Statman::get().get_by_name("eth0.ethernet.packets_tx").get_uint64();
     auto eth1_rx  = Statman::get().get_by_name("eth1.ethernet.packets_rx").get_uint64();
@@ -336,14 +343,18 @@ void Service::start(const std::string&)
     printf("HEAP: %zuMb ETH0: rx=%zu tx=%zu ETH1: rx=%zu tx=%zu\n",
       OS::heap_usage()/1024/1024, eth0_rx, eth0_tx, eth1_rx, eth1_tx);
     */
+    printf("Memory in use: %s Memory end: %#zx (%s) \n",
+      util::Byte_r(OS::heap_usage()).to_string().c_str(), OS::memory_end(),
+      util::Byte_r(OS::memory_end()).to_string().c_str());
+    StackSampler::print(10);
     for(auto i = 1; i <= 8; i++)
     {
       try {
         std::string name{"eth" + std::to_string(i)};
-        auto added = Statman::get().get_by_name(std::string{name + ".entries_added"}.c_str()).get_uint32();
-        auto shipped = Statman::get().get_by_name(std::string{name + ".entries_shipped"}.c_str()).get_uint32();
+        auto added = Statman::get().get_by_name(std::string{name + ".entries_added"}.c_str()).get_uint64();
+        auto shipped = Statman::get().get_by_name(std::string{name + ".entries_shipped"}.c_str()).get_uint64();
         auto eth_rx = Statman::get().get_by_name(std::string{name + ".ethernet.packets_rx"}.c_str()).get_uint64();
-        printf("%s eth_rx=%zu add=%u ship=%u\n", name.c_str(), eth_rx, added, shipped);
+        printf("%s eth_rx=%zu add=%zu ship=%zu\n", name.c_str(), eth_rx, added, shipped);
       }
       catch (...)
       {}
