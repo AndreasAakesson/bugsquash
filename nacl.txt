@@ -1,6 +1,6 @@
 Iface out {
   index: 0,
-  address: 10.0.1.10,
+  address: 10.0.0.10,
   netmask: 255.255.255.0
 }
 

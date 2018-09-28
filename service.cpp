@@ -22,6 +22,7 @@
 #include <net/super_stack.hpp>
 #include <net/nat/napt.hpp>
 #include <net/router.hpp>
+#include <os>
 
 using namespace net;
 
@@ -42,7 +43,7 @@ Filter_verdict<IP4> iperf_snat(IP4::IP_packet_ptr pckt, Inet&, Conntrack::Entry_
       or tcp_pckt.dst_port() == 5205 or tcp_pckt.dst_port() == 5206
       or tcp_pckt.dst_port() == 5207 or tcp_pckt.dst_port() == 5208))
     {
-      natty->snat(*pckt, ct_entry, IP4::addr{10,0,1,10});
+      natty->snat(*pckt, ct_entry, IP4::addr{10,0,0,10});
     }
   }
 
@@ -62,11 +63,129 @@ Filter_verdict<IP4> iperf_dnat(IP4::IP_packet_ptr pckt, Inet&, Conntrack::Entry_
       or tcp_pckt.dst_port() == 5205 or tcp_pckt.dst_port() == 5206
       or tcp_pckt.dst_port() == 5207 or tcp_pckt.dst_port() == 5208))
     {
-      natty->dnat(*pckt, ct_entry, IP4::addr{10,0,1,1});
+      natty->dnat(*pckt, ct_entry, IP4::addr{10,0,0,1});
     }
   }
   return {std::move(pckt), Filter_verdict_type::ACCEPT};
 }
+
+struct Buffer
+{
+  static constexpr size_t limit = 128;
+  using Pkt_ptr = IP4::IP_packet_ptr;
+
+  Buffer() = default;
+
+  Buffer(Inet& stack)
+    : inet{stack},
+      entries_added{Statman::get().create(Stat::UINT32,inet.ifname() + ".entries_added").get_uint32()},
+      entries_shipped{Statman::get().create(Stat::UINT32,inet.ifname() + ".entries_shipped").get_uint32()}
+  {}
+
+  struct Entry
+  {
+    Pkt_ptr               pkt;
+    ip4::Addr             dest;
+    Conntrack::Entry_ptr  ct;
+  };
+
+  Inet& inet;
+
+  void add(std::unique_ptr<Entry> entry)
+  {
+    Expects(not full());
+    entries.push_back(std::move(entry));
+    entries_added++;
+  }
+
+  void ship_one()
+  {
+    auto entry = std::move(entries.front());
+    entries.pop_front();
+    inet.ip_obj().ship(std::move(entry->pkt), entry->dest, entry->ct);
+    entries_shipped++;
+  }
+
+  constexpr bool empty() const noexcept
+  { return entries.empty(); }
+
+  constexpr bool full() const noexcept
+  { return entries.size() >= limit; }
+
+private:
+  std::deque<std::unique_ptr<Entry>> entries;
+  uint32_t& entries_added;
+  uint32_t& entries_shipped;
+};
+
+struct Router_buffer
+{
+  bool add(Inet& inet, Buffer::Entry&& entry)
+  {
+    auto it = std::find_if(buffers.begin(), buffers.end(),
+      [&](const auto& ref) { return &inet == &ref.inet; });
+
+    // there is one with buffers
+    if(it != buffers.end())
+    {
+      if(it->full())
+        return false;
+
+      it->add(std::make_unique<Buffer::Entry>(std::move(entry)));
+      return true;
+    }
+
+    // there wasnt none, see if there is an empty
+    it = std::find_if(buffers_empty.begin(), buffers_empty.end(),
+      [&](const auto& ref) { return &inet == &ref.inet; });
+
+    // there was an already empty one
+    if(it != buffers_empty.end())
+    {
+      // move it to non-empty buffers
+      buffers.splice(buffers.end(), buffers_empty, it);
+      //printf("moved %s to non-empty\n", buffers.back().inet.ifname().c_str());
+    }
+    else
+    {
+      buffers.push_back({inet});
+      it = std::prev(buffers.end());
+    }
+
+    it->add(std::make_unique<Buffer::Entry>(std::move(entry)));
+    return true;
+  }
+
+  void process(size_t avail)
+  {
+    //printf("process begin %zu\n", avail);
+    while(not buffers.empty() and avail)
+    {
+      for(auto it = buffers.begin(); it != buffers.end();)
+      {
+        if(not avail)
+          break;
+        if(not it->empty())
+        {
+          it->ship_one();
+          avail--;
+          it++;
+        }
+        else
+        {
+          auto to_move = it++;
+          buffers_empty.splice(buffers_empty.end(), buffers, to_move);
+          //printf("moved %s to empty\n", buffers_empty.back().inet.ifname().c_str());
+        }
+      }
+    }
+    //printf("process end %zu\n", avail);
+  }
+
+  std::list<Buffer> buffers;
+  std::list<Buffer> buffers_empty;
+};
+
 
 void Service::start(const std::string&)
 {
@@ -134,7 +253,7 @@ void Service::start(const std::string&)
 
   // Router
   Router<IP4>::Routing_table routing_table {
-    { IP4::addr{10,0,1,0}, IP4::addr{255,255,255,0}, 0, out, 1 },
+    { IP4::addr{10,0,0,0}, IP4::addr{255,255,255,0}, 0, out, 1 },
     { IP4::addr{10,0,0,101}, IP4::addr{255,255,255,255}, 0, in1, 1 },
     { IP4::addr{10,0,0,102}, IP4::addr{255,255,255,255}, 0, in2, 1 },
     { IP4::addr{10,0,0,103}, IP4::addr{255,255,255,255}, 0, in3, 1 },
@@ -156,10 +275,17 @@ void Service::start(const std::string&)
   in7.set_forward_delg(router->forward_delg());
   in8.set_forward_delg(router->forward_delg());
 
+  //in1.nic().set_buffer_limit(256);
+  //in2.nic().set_buffer_limit(256);
+  //out.nic().set_sendq_limit(80);
+
+  static Router_buffer buffer;
+  out.on_transmit_queue_available({buffer, &Router_buffer::process});
+
   auto forward_hack = [](IP4::IP_packet_ptr pckt, Inet& inet, Conntrack::Entry_ptr entry)-> auto
   {
     static const auto dest = ip4::Addr{10,0,0,1};
-    if (pckt->ip_protocol() == Protocol::TCP and pckt->ip_dst() == ip4::Addr{10,0,0,1} and &inet == &out)
+    if (pckt->ip_protocol() == Protocol::TCP and pckt->ip_dst() == dest and &inet == &out)
     {
       auto& tcp_pckt = static_cast<tcp::Packet&>(*pckt);
 
@@ -182,6 +308,19 @@ void Service::start(const std::string&)
 
       return Filter_verdict<IP4>{nullptr, Filter_verdict_type::DROP};
     }
+    else if(pckt->ip_protocol() == Protocol::TCP and pckt->ip_src() == dest and &inet != &out)
+    {
+      // it's being forwarded to "out"
+      if(not out.transmit_queue_available())
+      {
+        bool added = buffer.add(inet, {std::move(pckt), dest, entry});
+        /*if(added)
+          printf("added entry to %s\n", inet.ifname().c_str());
+        else
+          printf("failed to add entry to %s\n", inet.ifname().c_str());*/
+        return Filter_verdict<IP4>{nullptr, Filter_verdict_type::DROP};
+      }
+    }
 
     return Filter_verdict<IP4>{std::move(pckt), Filter_verdict_type::ACCEPT};
   };
@@ -190,11 +329,25 @@ void Service::start(const std::string&)
 
   using namespace std::chrono;
   Timers::periodic(3s, 3s, [](auto) {
-    auto eth0_rx  = Statman::get().get_by_name("eth0.ethernet.packets_rx").get_uint64();
+    /*auto eth0_rx  = Statman::get().get_by_name("eth0.ethernet.packets_rx").get_uint64();
     auto eth0_tx  = Statman::get().get_by_name("eth0.ethernet.packets_tx").get_uint64();
     auto eth1_rx  = Statman::get().get_by_name("eth1.ethernet.packets_rx").get_uint64();
     auto eth1_tx  = Statman::get().get_by_name("eth1.ethernet.packets_tx").get_uint64();
-    printf("ETH0: rx=%zu tx=%zu ETH1: rx=%zu tx=%zu\n",
-      eth0_rx, eth0_tx, eth1_rx, eth1_tx);
+    printf("HEAP: %zuMb ETH0: rx=%zu tx=%zu ETH1: rx=%zu tx=%zu\n",
+      OS::heap_usage()/1024/1024, eth0_rx, eth0_tx, eth1_rx, eth1_tx);
+    */
+    for(auto i = 1; i <= 8; i++)
+    {
+      try {
+        std::string name{"eth" + std::to_string(i)};
+        auto added = Statman::get().get_by_name(std::string{name + ".entries_added"}.c_str()).get_uint32();
+        auto shipped = Statman::get().get_by_name(std::string{name + ".entries_shipped"}.c_str()).get_uint32();
+        auto eth_rx = Statman::get().get_by_name(std::string{name + ".ethernet.packets_rx"}.c_str()).get_uint64();
+        printf("%s eth_rx=%zu add=%u ship=%u\n", name.c_str(), eth_rx, added, shipped);
+      }
+      catch (...)
+      {}
+    }
+
   });
 }
